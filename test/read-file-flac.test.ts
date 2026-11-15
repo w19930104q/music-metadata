@@ -6,7 +6,12 @@ import path from 'node:path';
 import * as tokens from 'music-metadata/tokens';
 import * as flacTokens from 'music-metadata/tokens/flac';
 import { assert } from 'vitest';
-import { BlockStreamInfo } from '../lib/flac/FlacToken.js';
+import {
+  BlockStreamInfo,
+  flacChannelCount,
+  parseFlacFrameHeader,
+  validateFlacFrameCrc8
+} from '../lib/flac/FlacToken.js';
 import * as mm from '../lib/index.js';
 import { LyricsContentType, TimestampFormat, UnexpectedFileContentError } from '../lib/index.js';
 import { type IVorbisPicture, VorbisPictureToken } from '../lib/ogg/vorbis/Vorbis.js';
@@ -232,6 +237,228 @@ describe('Parse FLAC Vorbis comment', () => {
     const { format } = await mm.parseFile(filePath);
 
     assert.isUndefined(format.duration, 'format.duration');
+  });
+
+  it('Recovers duration via frame scan when totalSamples is zero (duration: true)', async () => {
+    const filePath = path.join(flacFilePath, 'test-unknown-duration.flac');
+
+    const { format } = await mm.parseFile(filePath, { duration: true });
+
+    assert.isNumber(format.duration, 'format.duration');
+    assert.approximately(format.duration, 4.46, 0.1);
+    assert.isNumber(format.numberOfSamples, 'format.numberOfSamples');
+  });
+
+  describe('parseFlacFrameHeader', () => {
+    const data = fs.readFileSync(path.join(flacFilePath, 'test-unknown-duration.flac'));
+
+    it('parses a valid fixed-blocksize FLAC frame header (frame 0)', () => {
+      const header = parseFlacFrameHeader(data, 8288);
+
+      assert.strictEqual(header.blockingStrategy, false);
+      assert.strictEqual(header.blockSize, 4096);
+      assert.strictEqual(header.sampleRate, 44100);
+      assert.strictEqual(header.channelAssignment, 0);
+      assert.strictEqual(header.sampleSizeBits, 4);
+      assert.strictEqual(header.number, 0);
+      assert.strictEqual(header.crc8Position, undefined);
+      assert.strictEqual(header.storedCrc8, undefined);
+    });
+
+    it('parses a valid fixed-blocksize FLAC frame header (frame 1)', () => {
+      const header = parseFlacFrameHeader(data, 9605);
+
+      assert.strictEqual(header.blockingStrategy, false);
+      assert.strictEqual(header.blockSize, 4096);
+      assert.strictEqual(header.sampleRate, 44100);
+      assert.strictEqual(header.channelAssignment, 0);
+      assert.strictEqual(header.sampleSizeBits, 4);
+      assert.strictEqual(header.number, 1);
+    });
+
+    it('parses the last valid FLAC frame header (frame 47)', () => {
+      const header = parseFlacFrameHeader(data, 69564);
+
+      assert.strictEqual(header.blockingStrategy, false);
+      assert.strictEqual(header.number, 47);
+    });
+
+    it('throws on invalid sync byte', () => {
+      assert.throws(() => parseFlacFrameHeader(data, 8287));
+    });
+
+    it('throws on reserved bit set in byte 1', () => {
+      const buf = new Uint8Array([0xff, 0xfa, 0x59, 0x08, 0x00]);
+      assert.throws(() => parseFlacFrameHeader(buf, 0));
+    });
+
+    it('throws on reserved block size bits (0x00)', () => {
+      const buf = new Uint8Array([0xff, 0xf8, 0x00, 0x08, 0x00]);
+      assert.throws(() => parseFlacFrameHeader(buf, 0));
+    });
+
+    it('throws on reserved sample size bit', () => {
+      const buf = new Uint8Array([0xff, 0xf8, 0x59, 0x09, 0x00]);
+      assert.throws(() => parseFlacFrameHeader(buf, 0));
+    });
+  });
+
+  describe('validateFlacFrameCrc8', () => {
+    const data = fs.readFileSync(path.join(flacFilePath, 'test-unknown-duration.flac'));
+
+    it('validates a header without CRC-8 (no crc8Position)', () => {
+      const header = parseFlacFrameHeader(data, 8288);
+      assert.strictEqual(header.crc8Position, undefined);
+      assert.strictEqual(header.storedCrc8, undefined);
+    });
+
+    it('computes CRC-8 correctly for a single byte', () => {
+      // Build CRC-8 table (polynomial x^8 + x^2 + x^1 + 1, init 0x00)
+      const table = new Uint8Array(256);
+      for (let i = 0; i < 256; ++i) {
+        let crc = i;
+        for (let j = 0; j < 8; ++j) {
+          crc = (crc & 0x80) !== 0 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+        }
+        table[i] = crc;
+      }
+      // Buffer: [data byte, CRC byte], CRC computed over bytes [0, 1)
+      const dataByte = 0x42;
+      const buf = new Uint8Array([dataByte, table[dataByte]]);
+      assert.strictEqual(validateFlacFrameCrc8(buf, 1, buf[1]), true);
+      assert.strictEqual(validateFlacFrameCrc8(buf, 1, (buf[1] + 1) & 0xff), false);
+    });
+
+    it('computes CRC-8 over multiple bytes', () => {
+      const table = new Uint8Array(256);
+      for (let i = 0; i < 256; ++i) {
+        let crc = i;
+        for (let j = 0; j < 8; ++j) {
+          crc = (crc & 0x80) !== 0 ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+        }
+        table[i] = crc;
+      }
+      const dataBytes = new Uint8Array([0x01, 0x02, 0x03]);
+      let crc = 0;
+      for (const b of dataBytes) {
+        crc = table[crc ^ b];
+      }
+      const buf = new Uint8Array([...dataBytes, crc]);
+      assert.strictEqual(validateFlacFrameCrc8(buf, 3, buf[3]), true);
+      assert.strictEqual(validateFlacFrameCrc8(buf, 3, (buf[3] + 1) & 0xff), false);
+    });
+  });
+
+  describe('flacChannelCount', () => {
+    it.each([
+      [0, 1],
+      [1, 2],
+      [2, 3],
+      [3, 4],
+      [4, 5],
+      [5, 6],
+      [6, 7],
+      [7, 8],
+      [8, 2],
+      [9, 6],
+      [10, 7],
+      [11, 1],
+      [15, 1],
+      [255, 1]
+    ])('channel assignment %i returns %i channels', (assignment, expected) => {
+      assert.strictEqual(flacChannelCount(assignment), expected);
+    });
+  });
+
+  describe('parseFlacFrameHeader with optional fields', () => {
+    it('parses block size from header (blockSizeBits=0x08) with CRC-8', () => {
+      // Block size 4096 as UTF-8 coded number: 0xE1 0x80 0x80
+      // BlockSizeBits=0x08, SampleRateBits=0x09 (44100)
+      // CRC-8 present because blockSizeBits >= 0x08
+      const buf = new Uint8Array([
+        0xff,
+        0xf8, // sync
+        0x89, // blockSizeBits=8, sampleRateBits=9
+        0x08, // channelAssignment=0, sampleSizeBits=4, reserved=0
+        0x00, // frame number 0
+        0xe1,
+        0x80,
+        0x80, // block size 4096 (UTF-8 coded)
+        0x00 // CRC-8 placeholder
+      ]);
+      const header = parseFlacFrameHeader(buf, 0);
+
+      assert.strictEqual(header.blockingStrategy, false);
+      assert.strictEqual(header.blockSize, 4096);
+      assert.strictEqual(header.sampleRate, 44100);
+      assert.strictEqual(header.number, 0);
+      assert.strictEqual(header.crc8Position, 8);
+      assert.strictEqual(header.storedCrc8, 0x00);
+      assert.strictEqual(header.headerBytes, 9);
+    });
+
+    it('parses sample rate from header (sampleRateBits=0x0c) with CRC-8', () => {
+      // SampleRateBits=0x0c: 16-bit sample rate follows
+      // BlockSizeBits=0x05: blockSize = 1 << 12 = 4096
+      // Sample rate 44100 = 0xAC44
+      const buf = new Uint8Array([
+        0xff,
+        0xf8, // sync
+        0x5c, // blockSizeBits=5, sampleRateBits=12
+        0x08, // channelAssignment=0, sampleSizeBits=4, reserved=0
+        0x00, // frame number 0
+        0xac,
+        0x44, // sample rate 44100
+        0x00 // CRC-8 placeholder
+      ]);
+      const header = parseFlacFrameHeader(buf, 0);
+
+      assert.strictEqual(header.blockingStrategy, false);
+      assert.strictEqual(header.blockSize, 4096);
+      assert.strictEqual(header.sampleRate, 44100);
+      assert.strictEqual(header.number, 0);
+      assert.strictEqual(header.crc8Position, 7);
+      assert.strictEqual(header.storedCrc8, 0x00);
+      assert.strictEqual(header.headerBytes, 8);
+    });
+
+    it('parses variable-blocksize frame (blockingStrategy=true)', () => {
+      // BlockingStrategy=true, BlockSizeBits=0x05, SampleRateBits=0x09
+      // blockSize is still set from bits even for variable-blocksize
+      const buf = new Uint8Array([
+        0xff,
+        0xf9, // sync, blockingStrategy=true
+        0x59, // blockSizeBits=5, sampleRateBits=9
+        0x08, // channelAssignment=0, sampleSizeBits=4, reserved=0
+        0x00, // coded sample number 0
+        0x00 // no CRC (blockSizeBits < 8, sampleRateBits < 0x0c)
+      ]);
+      const header = parseFlacFrameHeader(buf, 0);
+
+      assert.strictEqual(header.blockingStrategy, true);
+      assert.strictEqual(header.blockSize, 4096);
+      assert.strictEqual(header.sampleRate, 44100);
+      assert.strictEqual(header.number, 0);
+      assert.strictEqual(header.crc8Position, undefined);
+      assert.strictEqual(header.storedCrc8, undefined);
+    });
+
+    it('parses variable-blocksize with coded sample number > 127', () => {
+      // Coded sample number 300 = 0xC4 0xAC (2-byte UTF-8)
+      const buf = new Uint8Array([
+        0xff,
+        0xf9, // sync, blockingStrategy=true
+        0x59, // blockSizeBits=5, sampleRateBits=9
+        0x08, // channelAssignment=0, sampleSizeBits=4, reserved=0
+        0xc4,
+        0xac, // coded sample number 300
+        0x00 // no CRC
+      ]);
+      const header = parseFlacFrameHeader(buf, 0);
+
+      assert.strictEqual(header.blockingStrategy, true);
+      assert.strictEqual(header.number, 300);
+    });
   });
 
   it('Support additional Vorbis comment TAG mapping "ALMBUM ARTIST"', async () => {
