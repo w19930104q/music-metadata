@@ -417,7 +417,8 @@ describe('Matroska formats', () => {
           assert.strictEqual(actual.format.container, expected.format.container);
           assert.deepEqual(actual.format.trackInfo, expected.format.trackInfo);
           assert.deepEqual(actual.common, expected.common);
-          assert.isUndefined(actual.format.duration);
+          assert.isNumber(actual.format.duration);
+          assert.approximately(actual.format.duration, expected.format.duration ?? 25.5, 0.1);
         });
       }
     }

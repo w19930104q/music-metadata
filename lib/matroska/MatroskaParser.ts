@@ -2,7 +2,7 @@ import initDebug from 'debug';
 
 import { BasicParser } from '../common/BasicParser.js';
 import { EbmlIterator, ParseAction } from '../ebml/EbmlIterator.js';
-import type { IElementContext } from '../ebml/types.js';
+import type { IElementContext, ITree } from '../ebml/types.js';
 import type { AnyTagValue, ITrackInfo, IVideoTrack } from '../type.js';
 import { matroskaDtd } from './MatroskaDtd.js';
 import {
@@ -74,6 +74,17 @@ export class MatroskaParser extends BasicParser {
    * Significant performance impact
    */
   private flagUseIndexToSkipClusters = this.options.mkvUseIndex ?? false;
+  /**
+   * When `duration: true` and no duration from Segment Info / track statistics,
+   * scan Cluster block timing to recover presentation duration.
+   */
+  private flagScanClusterTiming = false;
+  private timecodeScaleNs = 1000000;
+  private clusterTimecode = 0;
+  private trackMaxEndNs = new Map<string, number>();
+  private trackDefaultDuration = new Map<string, number>();
+  private trackLastTimestampNs = new Map<string, number>();
+  private trackMinDeltaNs = new Map<string, number>();
 
   public async parse(): Promise<void> {
     const containerSize = this.tokenizer.fileInfo.size ?? Number.MAX_SAFE_INTEGER;
@@ -83,7 +94,13 @@ export class MatroskaParser extends BasicParser {
     debug('Initializing DTD end MatroskaIterator');
     await matroskaIterator.iterate(matroskaDtd, containerSize, {
       // Process tags and attachments one at a time. Never assemble a Segment/root tree.
-      collect: element => [0x114d9b74, 0x1549a966, 0x1654ae6b, 0x7373, 0x61a7].includes(element.id),
+      collect: element => {
+        const base = [0x114d9b74, 0x1549a966, 0x1654ae6b, 0x7373, 0x61a7].includes(element.id);
+        if (this.options.duration && element.id === 0x1f43b675) {
+          return true; // collect clusters for block-timing duration scan
+        }
+        return base;
+      },
       startNext: async element => {
         switch (element.id) {
           case 0x18538067: // SeekPosition is relative to the Segment payload, not the SeekHead.
@@ -109,6 +126,10 @@ export class MatroskaParser extends BasicParser {
             debug(`Skip element: name=${element.name}, id=0x${element.id.toString(16)}`);
             return ParseAction.IgnoreElement;
           case 0x1f43b675: // cluster
+            if (this.options.duration && !this.metadata.format.duration) {
+              this.flagScanClusterTiming = true;
+              return ParseAction.ReadNext;
+            }
             if (this.flagUseIndexToSkipClusters && this.seekHead) {
               const index = (this.seekHead.seek ?? []).find(
                 index => index.position !== undefined && index.position + this.seekHeadOffset > this.tokenizer.position
@@ -148,6 +169,7 @@ export class MatroskaParser extends BasicParser {
                 await this.addTag('segment:title', info.title);
               }
               const timecodeScale = info.timecodeScale ? info.timecodeScale : 1000000;
+              this.timecodeScaleNs = timecodeScale;
               if (typeof info.duration === 'number') {
                 const duration = (info.duration * timecodeScale) / 1000000000;
                 if (Number.isFinite(duration) && duration > 0) {
@@ -199,7 +221,12 @@ export class MatroskaParser extends BasicParser {
                     stream.video = { ...stream.video, frameRate: 1e9 / entry.defaultDuration };
                   }
                   if (entry.uid) {
-                    this.tracksByUid.set(this.uidKey(entry.uid), stream);
+                    const key = this.uidKey(entry.uid);
+                    this.tracksByUid.set(key, stream);
+                    this.trackNumberToUid.set(entry.trackNumber, key);
+                    if (entry.trackType === TrackType.audio && entry.defaultDuration && entry.defaultDuration > 0) {
+                      this.trackDefaultDuration.set(key, entry.defaultDuration);
+                    }
                   }
                   this.metadata.addStreamInfo(stream);
                 });
@@ -321,11 +348,142 @@ export class MatroskaParser extends BasicParser {
             }
             break;
           }
+
+          // Cluster block-timing duration scan (only when flagScanClusterTiming)
+          case 0xe7: // ClusterTimecode
+            if (this.flagScanClusterTiming) {
+              this.clusterTimecode = event.value as number;
+            }
+            break;
+
+          case 0xa3: // SimpleBlock
+            if (this.flagScanClusterTiming) {
+              this.processSimpleBlock(event.value as Uint8Array);
+            }
+            break;
+
+          case 0xa0: // BlockGroup
+            if (this.flagScanClusterTiming && event.value && typeof event.value === 'object') {
+              this.processBlockGroup(event.value as ITree);
+            }
+            break;
         }
       }
     });
     this.applyTrackStatistics();
+    this.applyClusterTiming();
     await this.resolveTrackAlbum();
+  }
+
+  private trackNumberToUid = new Map<number, string>();
+
+  /**
+   * Parse a SimpleBlock / Block binary payload and update the max presentation
+   * end time for the referenced track. Block payload layout:
+   *   TrackNumber (vint), Timestamp (int16 BE), Flags (1 byte), [lace data], Frame data
+   */
+  private processBlockPayload(data: Uint8Array, blockDuration?: number): void {
+    if (data.length < 4) {
+      return;
+    }
+    let pos = 0;
+    // Read VINT track number: count leading zero bits to determine length
+    const first = data[pos];
+    let trackNumberLength = 1;
+    let mask = 0x80;
+    while ((first & mask) === 0) {
+      ++trackNumberLength;
+      mask >>= 1;
+      if (trackNumberLength > 8) {
+        return;
+      }
+    }
+    if (pos + trackNumberLength + 2 > data.length) {
+      return;
+    }
+    let trackNumber = first & (0x7f >> (trackNumberLength - 1));
+    for (let i = 1; i < trackNumberLength; ++i) {
+      trackNumber = (trackNumber << 8) | data[pos + i];
+    }
+    pos += trackNumberLength;
+    // Read int16 timestamp (relative to cluster timecode)
+    const timestamp = (data[pos] << 8) | data[pos + 1];
+    const signedTimestamp = timestamp & 0x8000 ? timestamp - 0x10000 : timestamp;
+    pos += 2;
+    // Flags byte
+    const flags = data[pos];
+    const lacing = (flags >> 4) & 0x03;
+
+    const uidKey = this.trackNumberToUid.get(trackNumber);
+    if (uidKey === undefined) {
+      return;
+    }
+
+    // Presentation time in nanoseconds
+    const timecodeScale = this.timecodeScaleNs;
+    const presentationNs = (this.clusterTimecode + signedTimestamp) * timecodeScale;
+
+    // Track timestamp deltas to estimate block duration when BlockDuration is absent
+    const lastTs = this.trackLastTimestampNs.get(uidKey);
+    if (lastTs !== undefined) {
+      const delta = presentationNs - lastTs;
+      if (delta > 0) {
+        const curMin = this.trackMinDeltaNs.get(uidKey);
+        if (curMin === undefined || delta < curMin) {
+          this.trackMinDeltaNs.set(uidKey, delta);
+        }
+      }
+    }
+    this.trackLastTimestampNs.set(uidKey, presentationNs);
+
+    // Duration in timecode-scale units: BlockDuration > track defaultDuration > estimated delta
+    let durationUnits = blockDuration;
+    if (durationUnits === undefined) {
+      durationUnits = this.trackDefaultDuration.get(uidKey);
+    }
+    if (durationUnits === undefined) {
+      const minDelta = this.trackMinDeltaNs.get(uidKey);
+      if (minDelta !== undefined) {
+        durationUnits = minDelta / timecodeScale;
+      }
+    }
+
+    const presentationEndNs = presentationNs + (durationUnits ?? 0) * timecodeScale;
+
+    const current = this.trackMaxEndNs.get(uidKey) ?? 0;
+    if (presentationEndNs > current) {
+      this.trackMaxEndNs.set(uidKey, presentationEndNs);
+    }
+
+    // Track lacing for potential frame-count refinement; ignored in this scan.
+    void lacing;
+    void flags;
+  }
+
+  private processSimpleBlock(data: Uint8Array): void {
+    this.processBlockPayload(data);
+  }
+
+  private processBlockGroup(tree: ITree): void {
+    const block = tree.block;
+    const blockDuration = tree.blockDuration;
+    if (block instanceof Uint8Array) {
+      this.processBlockPayload(block, typeof blockDuration === 'number' ? blockDuration : undefined);
+    }
+  }
+
+  private applyClusterTiming(): void {
+    if (!this.flagScanClusterTiming || !this.selectedAudioTrackUid) {
+      return;
+    }
+    const maxEndNs = this.trackMaxEndNs.get(this.selectedAudioTrackUid);
+    if (maxEndNs === undefined || maxEndNs <= 0) {
+      return;
+    }
+    const duration = maxEndNs / 1e9;
+    if (!this.metadata.format.duration || duration < this.metadata.format.duration) {
+      this.metadata.setFormat('duration', duration);
+    }
   }
 
   private addNativeTag(tagId: string, value: AnyTagValue): void {

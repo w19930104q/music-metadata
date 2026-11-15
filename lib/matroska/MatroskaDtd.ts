@@ -80,7 +80,15 @@ export const matroskaDtd = {
             },
             0xa7: { name: 'position', value: DataType.uint },
             0xab: { name: 'prevSize', value: DataType.uint },
-            0xa0: { name: 'blockGroup', multiple: true },
+            0xa0: {
+              name: 'blockGroup',
+              multiple: true,
+              container: {
+                0xa1: { name: 'block', value: DataType.binary },
+                0x7a: { name: 'blockVirtual', value: DataType.bool },
+                0x7b: { name: 'blockDuration', value: DataType.uint }
+              }
+            },
             0xa3: { name: 'simpleBlock', value: DataType.binary, multiple: true }
           }
         },
