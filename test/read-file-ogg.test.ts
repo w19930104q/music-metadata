@@ -306,6 +306,24 @@ describe('Parse Ogg', () => {
     });
   });
 
+  describe('Chained Ogg logical streams', () => {
+    // Chained bitstream: concatenation of nirvana-2sec.vorbis.ogg and
+    // nirvana-2sec.opus.ogg; two complete chain links with distinct stream serials.
+    const filePath = path.join(oggSamplePath, 'chained-vorbis-opus.ogg');
+
+    Parsers.forEach(parser => {
+      it(parser.description, async context => {
+        const { format } = await parser.parse(() => context.skip(), filePath, 'audio/ogg');
+        const tracks = format.trackInfo;
+        assert.strictEqual(tracks.length, 2, 'each chained logical stream is reported');
+        assert.strictEqual(tracks[0].codecName, 'Vorbis I', 'first chain link codec');
+        assert.strictEqual(tracks[1].codecName, 'Opus', 'second chain link codec');
+        assert.strictEqual(tracks[0].duration, 2.0, 'first chain link duration');
+        assert.approximately(tracks[1].duration!, 2.0, 1 / 200, 'last chain link duration');
+      });
+    });
+  });
+
   describe('Parsing Ogg/Speex', () => {
     describe("decode: 'female_scrub.spx'", () => {
       const filePath = path.join(samplePath, 'female_scrub.spx');

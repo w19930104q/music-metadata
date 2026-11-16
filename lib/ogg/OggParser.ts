@@ -109,7 +109,10 @@ class OggStream {
  * Parser for Ogg logical bitstream framing
  */
 export class OggParser extends BasicParser {
+  /** Active logical streams, looked up by stream serial number. */
   private streams = new Map<number, OggStream>();
+  /** All logical streams, including links of a chained bitstream, in order of appearance. */
+  private allStreams: OggStream[] = [];
 
   /**
    * Parse page
@@ -117,6 +120,7 @@ export class OggParser extends BasicParser {
    */
   public async parse(): Promise<void> {
     this.streams = new Map<number, OggStream>();
+    this.allStreams = [];
     const maxLogicalStreams = getMaxMetadataEntries(this.options);
     let enfOfStream = false;
     let stoppedEarly = false;
@@ -131,26 +135,37 @@ export class OggParser extends BasicParser {
         }
 
         let stream = this.streams.get(header.streamSerialNumber);
+        if (stream?.closed && header.headerType.firstPage) {
+          // Chained bitstream link reusing a stream serial number of a previous
+          // link: report it as a new logical stream.
+          stream = undefined;
+        }
         if (!stream) {
-          if (this.streams.size >= maxLogicalStreams) {
+          if (this.allStreams.length >= maxLogicalStreams) {
             throw new OggContentError('Logical stream count exceeds entry limit');
           }
           stream = new OggStream(this.metadata, header.streamSerialNumber, this.options);
           this.streams.set(header.streamSerialNumber, stream);
+          this.allStreams.push(stream);
         }
         await stream.parsePage(this.tokenizer, header);
 
         if (
           stream.pageNumber > 12 &&
           // A comment (including its cover art) may span more than 13 pages.
-          [...this.streams.values()].every(stream => stream.pageConsumer?.isMetadataComplete !== false) &&
-          !(this.options.duration && [...this.streams.values()].find(stream => stream.pageConsumer?.durationOnLastPage))
+          this.allStreams.every(stream => stream.pageConsumer?.isMetadataComplete !== false) &&
+          !(this.options.duration && this.allStreams.find(stream => stream.pageConsumer?.durationOnLastPage))
         ) {
           stoppedEarly = true;
           debug('Stop processing Ogg stream');
           break;
         }
-      } while (![...this.streams.values()].every(item => item.closed));
+      } while (
+        !this.allStreams.every(item => item.closed) ||
+        // Chained bitstream: another link may follow once all streams of the
+        // current link are closed.
+        (await this.nextChainLinkFollows())
+      );
     } catch (err) {
       if (err instanceof EndOfStreamError) {
         debug('Reached end-of-stream');
@@ -161,7 +176,7 @@ export class OggParser extends BasicParser {
         throw err;
       }
     }
-    for (const stream of this.streams.values()) {
+    for (const stream of this.allStreams) {
       if (!stream.closed) {
         if (!stoppedEarly) {
           this.metadata.addWarning(
@@ -198,10 +213,27 @@ export class OggParser extends BasicParser {
     }
     // Absence can only be determined after discovering the logical streams.
     for (const flag of ['hasAudio', 'hasVideo'] as const) {
-      const present = [...this.streams.values()].some(stream => stream.metadata.format[flag] === true);
+      const present = this.allStreams.some(stream => stream.metadata.format[flag] === true);
       if (this.metadata.format[flag] !== present) {
         this.metadata.setFormat(flag, present);
       }
+    }
+  }
+
+  /**
+   * Peek whether another chain link (a fresh Ogg page) follows the current one.
+   * Peeking leaves the tokenizer position untouched, so single-link files keep
+   * their existing end-of-stream behavior.
+   */
+  private async nextChainLinkFollows(): Promise<boolean> {
+    try {
+      const header = await this.tokenizer.peekToken<IPageHeader>(PageHeader);
+      return header.capturePattern === 'OggS';
+    } catch (err) {
+      if (err instanceof EndOfStreamError) {
+        return false;
+      }
+      throw err;
     }
   }
 }
